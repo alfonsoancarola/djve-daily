@@ -1,0 +1,15 @@
+# Credenciales — NUNCA subir a GitHub
+.djve_env
+*.env
+
+# Caches Python
+__pycache__/
+*.pyc
+
+# OS / IDE
+.DS_Store
+.vscode/
+.idea/
+
+# Importante: NO ignorar archive/ porque GitHub Actions necesita
+# commitear ahí el FOB cacheado para calcular variaciones día a día.

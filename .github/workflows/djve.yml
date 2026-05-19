@@ -1,0 +1,70 @@
+name: DJVE Daily Report
+
+on:
+  schedule:
+    # 16:00 ART = 19:00 UTC (Argentina sin horario de verano, UTC-3 fijo)
+    - cron: '0 19 * * *'
+  # Permite disparar manualmente desde la pestaña Actions
+  workflow_dispatch:
+
+permissions:
+  contents: write  # necesario para commitear el cache FOB diario
+
+jobs:
+  run-daily-report:
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+
+    steps:
+      - name: Checkout repo
+        uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
+          cache: 'pip'
+
+      - name: Install dependencies
+        run: pip install -r requirements.txt
+
+      - name: Write secrets to .djve_env
+        env:
+          SMTP_USER: ${{ secrets.SMTP_USER }}
+          SMTP_APP_PASSWORD: ${{ secrets.SMTP_APP_PASSWORD }}
+          EMAIL_RECIPIENTS: ${{ secrets.EMAIL_RECIPIENTS }}
+        run: |
+          cat > .djve_env <<EOF
+          SMTP_USER=${SMTP_USER}
+          SMTP_APP_PASSWORD=${SMTP_APP_PASSWORD}
+          SMTP_HOST=smtp.gmail.com
+          SMTP_PORT=465
+          EMAIL_FROM_NAME=Informe DJVE
+          EMAIL_SUBJECT_PREFIX=Informe DJVE
+          EMAIL_RECIPIENTS=${EMAIL_RECIPIENTS}
+          EOF
+          chmod 600 .djve_env
+
+      - name: Run daily report
+        run: python3 scripts/run_daily.py
+
+      - name: Commit FOB cache back to repo
+        run: |
+          git config user.name "github-actions[bot]"
+          git config user.email "github-actions[bot]@users.noreply.github.com"
+          git add archive/fob/*.json archive/*.pdf 2>/dev/null || true
+          if git diff --cached --quiet; then
+            echo "No cambios en archive — nada que commitear"
+          else
+            git commit -m "chore(daily): cache FOB y archivo PDF $(date -u +'%Y-%m-%d')"
+            git push
+          fi
+        continue-on-error: true
+
+      - name: Upload PDF as artifact (backup)
+        uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: informe-djve-${{ github.run_id }}
+          path: Informe_DJVE_Aprobadas.pdf
+          retention-days: 30
