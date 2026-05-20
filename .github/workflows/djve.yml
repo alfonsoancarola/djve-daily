@@ -2,9 +2,10 @@ name: DJVE Daily Report
 
 on:
   schedule:
-    # 16:00 ART = 19:00 UTC (Argentina sin horario de verano, UTC-3 fijo)
-    # 1-5 = lunes a viernes. Fines de semana no corre (no hay DJVE nuevas igual).
-    - cron: '0 19 * * 1-5'
+    # 14:00 ART = 17:00 UTC (Argentina sin horario de verano, UTC-3 fijo)
+    # 1-5 = lunes a viernes. El script verifica que hayan DJVE registradas hoy
+    # antes de mandar el mail; si todavía no están publicadas, sale sin enviar.
+    - cron: '0 17 * * 1-5'
   # Permite disparar manualmente desde la pestaña Actions
   workflow_dispatch:
 

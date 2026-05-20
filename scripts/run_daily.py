@@ -9,7 +9,7 @@ Pipeline:
 6. Enviar por mail
 """
 import os, re, json, sys
-from datetime import datetime
+from datetime import datetime, timedelta
 from pathlib import Path
 import urllib.request, ssl
 
@@ -17,8 +17,8 @@ BASE = Path(__file__).resolve().parent.parent
 WORK = Path('/tmp/djve_work'); WORK.mkdir(exist_ok=True)
 
 URL_DJVE = "https://www.magyp.gob.ar/sitio/areas/ss_mercados_agropecuarios/djve/_archivos/000011_Declaraciones%20Juradas%20de%20Ventas%20al%20Exterior%20(Ley%2021.453).php"
-def fob_url_for_date(d: datetime) -> str:
-    return f"https://dinem.magyp.gob.ar/dinem_fob.wp_fob_conslista.aspx?{d:%Y%m%d},1978,90,1"
+# URL sin parámetros → siempre devuelve la última circular publicada
+URL_FOB_LATEST = "https://dinem.magyp.gob.ar/dinem_fob.wp_fob_conslista.aspx"
 
 def step(m): print(f"\n=== {m} ===", flush=True)
 
@@ -52,81 +52,115 @@ for r in target.find_all('tr')[1:]:
 print(f"   {len(djve_rows)} DJVE parseadas")
 
 # ===== 2. FOB Minagri =====
-step("3. Descargando FOB oficial Minagri")
-# Try today's date first; if fails, fall back to most recent business day
-from datetime import timedelta
-fob_date = None
-html_fob = None
-today = datetime.now()
-for back_days in range(0, 10):
-    try_date = today - timedelta(days=back_days)
-    try:
-        h = http_get(fob_url_for_date(try_date))
-        # Valid pages with FOB data are ~85KB+; empty pages are ~15KB.
-        # Detect data by looking for the JSON array signature in hidden inputs.
-        if len(h) > 30_000 and re.search(r"value='\[\[\"\d{8}\"", h):
-            html_fob = h
-            fob_date = try_date
-            print(f"   FOB del {try_date:%d/%m/%Y} obtenido ({len(h):,} bytes)")
-            break
-        else:
-            print(f"   FOB {try_date:%Y-%m-%d}: sin datos ({len(h):,} bytes)")
-    except Exception as e:
-        print(f"   FOB {try_date:%Y-%m-%d}: {e}")
-if not html_fob:
-    print("ERROR: no se pudo obtener FOB en los últimos 10 días")
-    sys.exit(1)
-
-# Find the hidden input that contains the JSON FOB array.
-m = re.search(r"value='(\[\[\"\d{8}\".*?\]\])'", html_fob, re.DOTALL)
-fob_data = json.loads(m.group(1)) if m else []
-print(f"   {len(fob_data)} líneas FOB")
-
-# Cache FOB del día en archivo para comparar variaciones día a día
+step("3. Descargando FOB Minagri (latest + backfill anteriores)")
 fob_cache_dir = BASE / 'archive' / 'fob'
 fob_cache_dir.mkdir(parents=True, exist_ok=True)
-fob_today_file = fob_cache_dir / f"fob_{fob_date:%Y-%m-%d}.json"
-fob_today_file.write_text(json.dumps(fob_data, ensure_ascii=False), encoding='utf-8')
-print(f"   FOB cacheado: {fob_today_file.name}")
 
-# Buscar el FOB anterior más reciente (excluyendo hoy)
-prev_fob_data = None; prev_fob_date_str = None
-existing = sorted(fob_cache_dir.glob('fob_*.json'), reverse=True)
-for f in existing:
-    if f.name != fob_today_file.name:
-        try:
-            prev_fob_data = json.loads(f.read_text(encoding='utf-8'))
-            prev_fob_date_str = f.stem.replace('fob_', '')
-            print(f"   FOB anterior encontrado: {f.name} ({len(prev_fob_data)} líneas)")
+def parse_fob_html(h):
+    """Devuelve (date, circ, p3, p4, data) o (None,...) si la página no trae datos."""
+    if len(h) < 30_000 or not re.search(r"value='\[\[\"\d{8}\"", h):
+        return None
+    m_date = re.search(r'name="vFECHA"\s+value="(\d{1,2})/(\d{1,2})/(\d{4})"', h)
+    m_circ = re.search(r'name="vDIM_PRECIOFOB_NCIRC"\s+value="(\d+)"', h)
+    m_action = re.search(r'action="dinem_fob\.wp_fob_conslista\.aspx\?(\d{8}),(\d+),(\d+),(\d+)"', h)
+    m_data = re.search(r"value='(\[\[\"\d{8}\".*?\]\])'", h, re.DOTALL)
+    if not (m_date and m_circ and m_action and m_data):
+        return None
+    date = datetime(int(m_date.group(3)), int(m_date.group(2)), int(m_date.group(1)))
+    circ = int(m_circ.group(1))
+    p3 = int(m_action.group(3))
+    p4 = int(m_action.group(4))
+    data = json.loads(m_data.group(1))
+    return date, circ, p3, p4, data
+
+def cache_fob(date, data):
+    f = fob_cache_dir / f'fob_{date:%Y-%m-%d}.json'
+    if not f.exists():
+        f.write_text(json.dumps(data, ensure_ascii=False), encoding='utf-8')
+        print(f"   FOB cacheado: {f.name} ({len(data)} líneas)")
+        return True
+    return False
+
+def fetch_fob_by_params(date, circ, p3, p4=1):
+    url = f"https://dinem.magyp.gob.ar/dinem_fob.wp_fob_conslista.aspx?{date:%Y%m%d},{circ},{p3},{p4}"
+    try:
+        return http_get(url)
+    except Exception:
+        return None
+
+# 1) Latest
+html_fob_latest = http_get(URL_FOB_LATEST)
+parsed_latest = parse_fob_html(html_fob_latest)
+if parsed_latest:
+    latest_date, latest_circ, latest_p3, latest_p4, latest_data = parsed_latest
+    print(f"   Latest: FOB del {latest_date:%d/%m/%Y}, circ {latest_circ}, p3 {latest_p3}")
+    cache_fob(latest_date, latest_data)
+else:
+    print("   [WARN] Latest FOB no disponible, intento backfill desde cache existente")
+    latest_date = latest_circ = latest_p3 = latest_p4 = None
+
+# 2) Backfill: ir hacia atrás decrementando circ y p3, probando fechas previas (skip weekends/holidays)
+if parsed_latest:
+    circ_back = latest_circ - 1
+    p3_back = latest_p3 - 1
+    days_back_start = 1
+    while circ_back > 0 and circ_back >= latest_circ - 10:  # backfill hasta 10 circulares atrás
+        # Si ya tengo cacheada cualquier fecha con ese circ, skip (no sé qué fecha es pero asumo OK)
+        found = False
+        for delta in range(days_back_start, days_back_start + 6):
+            try_date = latest_date - timedelta(days=delta)
+            h = fetch_fob_by_params(try_date, circ_back, p3_back, latest_p4)
+            if h and (parsed := parse_fob_html(h)):
+                d, c, _, _, data = parsed
+                # Confirmar que es la circular que esperamos
+                if c == circ_back:
+                    if cache_fob(d, data):
+                        pass
+                    days_back_start = delta + 1
+                    found = True
+                    break
+        if not found:
             break
-        except Exception:
-            continue
-if prev_fob_data is None:
-    print("   (Sin FOB anterior — primera ejecución, no habrá variación diaria)")
+        circ_back -= 1
+        p3_back -= 1
 
-# ===== 2b. CBOT (Yahoo Finance) =====
-step("3b. Descargando CBOT (Chicago) nearest forward")
-CBOT_PRICES = {'Corn': None, 'Wheat': None, 'Soy': None}
-CBOT_DATE = None
-try:
-    import yfinance as yf
-    for label, sym in [('Corn','ZC=F'),('Wheat','ZW=F'),('Soy','ZS=F')]:
-        h = yf.Ticker(sym).history(period='5d')
-        if not h.empty:
-            CBOT_PRICES[label] = float(h['Close'].iloc[-1])
-            CBOT_DATE = h.index[-1].strftime('%d/%m/%Y')
-            print(f"   {label} ({sym}): {CBOT_PRICES[label]:.2f} c/bu (al {CBOT_DATE})")
-except Exception as e:
-    print(f"   [WARN] No se pudo obtener CBOT: {e}")
+# Lógica de negocio: usar FOB publicada ANTES de hoy (calendar)
+# Para DJVE registradas hoy, los precios vigentes son los publicados hasta ayer
+today_cal = datetime.now().replace(hour=0, minute=0, second=0, microsecond=0)
+cached_files = []
+for f in sorted(fob_cache_dir.glob('fob_*.json')):
+    try:
+        d = datetime.strptime(f.stem.replace('fob_', ''), '%Y-%m-%d')
+        cached_files.append((d, f))
+    except ValueError:
+        continue
+cached_files.sort(key=lambda x: x[0], reverse=True)
 
-# Conversion factor bushels / tonne — ONLY for Maíz
-# (USDA standard, 56 lb/bu). El replacement vs CBOT solo aplica al maíz en este informe.
-BU_PER_TN = {
-    'MAIZ': 39.368,
-}
-CBOT_REF = {
-    'MAIZ': 'Corn',
-}
+# Elegir el más reciente con fecha < hoy
+current_pair = next(((d, f) for d, f in cached_files if d < today_cal), None)
+# El siguiente más reciente con fecha < current = comparación "ayer"
+previous_pair = None
+if current_pair:
+    previous_pair = next(((d, f) for d, f in cached_files if d < current_pair[0]), None)
+
+if not current_pair:
+    print("ERROR: no hay FOB cacheada anterior a hoy disponible.")
+    sys.exit(1)
+
+fob_date, fob_file = current_pair
+fob_data = json.loads(fob_file.read_text(encoding='utf-8'))
+print(f"   FOB del informe (publicada el {fob_date:%d/%m/%Y}): {len(fob_data)} líneas")
+prev_fob_data = None; prev_fob_date_str = None
+if previous_pair:
+    prev_date, prev_file = previous_pair
+    prev_fob_data = json.loads(prev_file.read_text(encoding='utf-8'))
+    prev_fob_date_str = prev_date.strftime('%d/%m/%Y')
+    print(f"   FOB comparación (publicada el {prev_fob_date_str}): {len(prev_fob_data)} líneas")
+else:
+    print("   (Sin FOB de comparación — no hay otro anterior cacheado)")
+
+# Find the hidden input that contains the JSON FOB array.
+# (cache + selección hecha arriba)
 
 # ===== 3. Process =====
 import pandas as pd
@@ -223,32 +257,6 @@ def grain_key(producto):
             return kw
     return None
 
-def compute_replacement(row):
-    if pd.isna(row['fob_price']) or row['fob_price'] is None:
-        return None, None, None
-    gk = grain_key(row['producto'])
-    if gk is None:
-        return None, None, None
-    bu_tn = BU_PER_TN.get(gk)
-    cbot_ref = CBOT_REF.get(gk)
-    cbot = CBOT_PRICES.get(cbot_ref) if cbot_ref else None
-    if bu_tn is None or cbot is None:
-        return None, None, None
-    fob_cbu = row['fob_price'] * 100.0 / bu_tn
-    premium_cbu = fob_cbu - cbot
-    # Total USD = premium (cents/bu) / 100 × tons × bu/tn
-    total_usd = (premium_cbu / 100.0) * row['toneladas_num'] * bu_tn
-    return fob_cbu, premium_cbu, total_usd
-
-# Apply
-fob_cbu_list, premium_list, repl_usd_list = [], [], []
-for _, r in df.iterrows():
-    a, b, c = compute_replacement(r)
-    fob_cbu_list.append(a); premium_list.append(b); repl_usd_list.append(c)
-df['fob_cents_bu']   = fob_cbu_list
-df['premium_cents_bu'] = premium_list
-df['replacement_usd']  = repl_usd_list
-
 # ===== Filter ≥ 500 t =====
 THRESHOLD = 500
 df_big = df[df['toneladas_num'] >= THRESHOLD].copy()
@@ -309,29 +317,21 @@ def build_doc(out_path):
     story = []
     story.append(Paragraph('Informe Diario DJVE · Cereales', H1))
     story.append(Paragraph(
-        f'DJVE Ley 21.453 (Aprobadas) registros del <b>{fecha_reg}</b> &nbsp;·&nbsp; '
-        f'FOB oficial Minagri del <b>{fob_dt_str}</b> &nbsp;·&nbsp; '
-        f'Filtro: DJVE ≥ {THRESHOLD} t &nbsp;·&nbsp; Generado: {hoy}', SUB))
+        f'<b>Operaciones registradas el {fecha_reg}</b> &nbsp;·&nbsp; '
+        f'<b>Precios FOB publicados el {fob_dt_str}</b><br/>'
+        f'<font size=8 color="#64748b">DJVE Ley 21.453 (Aprobadas) &nbsp;·&nbsp; '
+        f'Filtro: DJVE ≥ {THRESHOLD} t &nbsp;·&nbsp; Generado: {hoy}</font>', SUB))
 
     # Resumen — SOLO cereales (Maíz, Trigo, Sorgo, Cebada)
     cereal_keys = [kw for _, kw in CEREALES]
     df_cereal = df_big[df_big['producto'].apply(lambda p: any(kw in p.upper() for kw in cereal_keys))]
     total_big = df_cereal['toneladas_num'].sum()
-    # Premium ponderado solo para Maíz (único grano con cálculo)
-    df_maiz_big = df_big[df_big['producto'].str.contains('MAIZ', case=False, na=False)]
-    valid_prem = df_maiz_big[df_maiz_big['premium_cents_bu'].notna()]
-    if len(valid_prem) > 0 and valid_prem['toneladas_num'].sum() > 0:
-        avg_prem = (valid_prem['premium_cents_bu'] * valid_prem['toneladas_num']).sum() / valid_prem['toneladas_num'].sum()
-        avg_prem_str = f'{avg_prem:+.1f} c/bu'
-    else:
-        avg_prem_str = '—'
     resumen_data = [[
         Paragraph(f'<b>{len(df_cereal)}</b><br/><font size=7 color="#64748b">DJVE ≥ {THRESHOLD}t (cereales)</font>', CEREAL_SUM),
         Paragraph(f'<b>{fmt_int(total_big) if total_big else "0"}</b><br/><font size=7 color="#64748b">Toneladas</font>', CEREAL_SUM),
         Paragraph(f'<b>{df_cereal["razon_social"].nunique() if len(df_cereal) else 0}</b><br/><font size=7 color="#64748b">Shippers únicos</font>', CEREAL_SUM),
-        Paragraph(f'<b>{avg_prem_str}</b><br/><font size=7 color="#64748b">Premium Maíz pond.</font>', CEREAL_SUM),
     ]]
-    rtbl = Table(resumen_data, colWidths=[4.5*cm]*4, rowHeights=[1.2*cm])
+    rtbl = Table(resumen_data, colWidths=[6.0*cm]*3, rowHeights=[1.2*cm])
     rtbl.setStyle(TableStyle([
         ('BACKGROUND', (0,0), (-1,-1), LIGHT),
         ('BOX', (0,0), (-1,-1), 0.5, rl_colors.HexColor('#cbd5e1')),
@@ -352,54 +352,29 @@ def build_doc(out_path):
             continue
 
         ton_g = g['toneladas_num'].sum()
-        is_maiz = (kw == 'MAIZ')
-        # Weighted average premium SOLO para maíz
-        prem_str = '—'
-        if is_maiz:
-            vg = g[g['premium_cents_bu'].notna()]
-            if len(vg) > 0 and vg['toneladas_num'].sum() > 0:
-                prem_avg = (vg['premium_cents_bu'] * vg['toneladas_num']).sum() / vg['toneladas_num'].sum()
-                prem_str = f'{prem_avg:+.1f} c/bu'
-
         # Compact summary line
-        header_extra = f' &nbsp;·&nbsp; premium pond. <b>{prem_str}</b>' if is_maiz else ''
         story.append(Paragraph(
             f'<b>{label}</b> &nbsp; <font size=8 color="#64748b">'
             f'{len(g)} DJVE &nbsp;·&nbsp; {fmt_int(ton_g)} t &nbsp;·&nbsp; '
-            f'{g["razon_social"].nunique()} shippers{header_extra}</font>',
+            f'{g["razon_social"].nunique()} shippers</font>',
             CEREAL_H))
 
-        # Build table — Maíz tiene columnas extras de CBOT/Premium
+        # Tabla simple: Shipper / Producto / Ton / Inicio / Fin / FOB U$/t
         g_sorted = g.sort_values('toneladas_num', ascending=False)
-        if is_maiz:
-            rows = [['Shipper', 'Ton.', 'Inicio', 'Fin', 'FOB U$/t', 'CBOT c/bu', 'Premium c/bu']]
-        else:
-            rows = [['Shipper', 'Producto', 'Ton.', 'Inicio', 'Fin', 'FOB U$/t']]
+        rows = [['Shipper', 'Producto', 'Ton.', 'Inicio', 'Fin', 'FOB U$/t']]
         for _, r in g_sorted.iterrows():
             shipper = r['razon_social']
-            shipper = shipper[:(38 if is_maiz else 32)] + ('…' if len(r['razon_social']) > (38 if is_maiz else 32) else '')
+            shipper = shipper[:32] + ('…' if len(r['razon_social']) > 32 else '')
             ini = r['fecha_inicio_dt'].strftime('%d/%m') if pd.notna(r['fecha_inicio_dt']) else '-'
             fin = r['fecha_fin_dt'].strftime('%d/%m') if pd.notna(r['fecha_fin_dt']) else '-'
             fob = f"{int(r['fob_price'])}" if pd.notna(r['fob_price']) else '—'
-            if is_maiz:
-                cbot_val = CBOT_PRICES.get('Corn')
-                cbot_s = f"{cbot_val:.1f}" if cbot_val else '—'
-                prem = f"{r['premium_cents_bu']:+.1f}" if pd.notna(r['premium_cents_bu']) else '—'
-                rows.append([shipper, fmt_int(r['toneladas_num']), ini, fin, fob, cbot_s, prem])
-            else:
-                prod = r['producto'].title().replace('Pan','Pan').replace('De','de').replace('La','la')
-                prod = prod[:22] + ('…' if len(prod) > 22 else '')
-                rows.append([shipper, prod, fmt_int(r['toneladas_num']), ini, fin, fob])
+            prod = r['producto'].title()
+            prod = prod[:22] + ('…' if len(prod) > 22 else '')
+            rows.append([shipper, prod, fmt_int(r['toneladas_num']), ini, fin, fob])
 
-        # Subtotal row
-        if is_maiz:
-            rows.append(['Total / Promedio ponderado', fmt_int(ton_g), '', '', '', '', prem_str])
-            col_widths = [6.5*cm, 1.7*cm, 1.5*cm, 1.5*cm, 1.7*cm, 1.9*cm, 2.2*cm]
-            num_col_start = 1
-        else:
-            rows.append(['Total', '', fmt_int(ton_g), '', '', ''])
-            col_widths = [6.0*cm, 4.5*cm, 1.8*cm, 1.6*cm, 1.6*cm, 2.0*cm]
-            num_col_start = 2
+        rows.append(['Total', '', fmt_int(ton_g), '', '', ''])
+        col_widths = [6.0*cm, 4.5*cm, 1.8*cm, 1.6*cm, 1.6*cm, 2.0*cm]
+        num_col_start = 2
 
         tbl = Table(rows, colWidths=col_widths)
         tbl.setStyle(TableStyle([
@@ -446,18 +421,21 @@ def build_doc(out_path):
     story.append(Spacer(1, 0.2*cm))
     section_h = ParagraphStyle('SH', parent=styles['Heading2'], fontName='Helvetica-Bold',
                                fontSize=10, textColor=NAVY, spaceBefore=4, spaceAfter=3, leading=12)
-    prev_note = f' &nbsp;<font size=7 color="#64748b">(vs FOB del {prev_fob_date_str})</font>' if prev_fob_date_str else ' <font size=7 color="#64748b">(primera ejecución — sin variación)</font>'
-    story.append(Paragraph('Precios FOB MINAGRI por producto · variación vs día previo' + prev_note, section_h))
+    prev_note = '' if prev_fob_date_str else ' <font size=7 color="#64748b">(primera ejecución — sin variación)</font>'
+    story.append(Paragraph('Precios FOB MINAGRI por producto · variación diaria' + prev_note, section_h))
 
     # Layout: 2 mini tables per row (Maíz+Trigo on row 1, Sorgo+Cebada... on row 2)
+    # Headers de las columnas de FOB con las fechas reales
+    col_hoy_label = f'FOB {fob_dt_str}'
+    col_ayer_label = f'FOB {prev_fob_date_str}' if prev_fob_date_str else 'FOB previo'
+
     def build_fob_table(label, desc_pat, pres_pat):
         # Filter rows
         relevant = [r for r in fob_data
                     if desc_pat in r[1].lower() and (pres_pat in r[1].lower() or not pres_pat)]
         if not relevant:
             return None
-        head = [[label, '', '', ''],
-                ['Mes embarque', 'Hoy U$/t', 'Ayer U$/t', 'Δ']]
+        head = [['Mes embarque', col_hoy_label, col_ayer_label, 'Δ']]
         rows = []
         for ncm, desc, price, mf, mt in relevant:
             p_today = float(price)
@@ -471,7 +449,7 @@ def build_doc(out_path):
                 f'{int(p_prev)}' if p_prev is not None else '—',
                 variation_pretty(p_today, p_prev),
             ])
-        return head[1:] + rows, label
+        return head + rows, label
 
     tables_data = []
     for label, desc_pat, pres_pat in FOB_FILTERS:
@@ -524,13 +502,8 @@ def build_doc(out_path):
         story.append(row_tbl)
 
     story.append(Spacer(1, 0.2*cm))
-    cbot_corn = CBOT_PRICES.get('Corn')
-    cbot_str = f"Corn nearest-forward {cbot_corn:.2f} c/bu" if cbot_corn else "Corn n/d"
     story.append(Paragraph(
-        f'Fuentes: MAGyP – DJVE Ley 21.453 (Aprobadas) · DINEM – FOB Oficial circular al {fob_dt_str} · '
-        f'CBOT vía Yahoo Finance al {CBOT_DATE or hoy}: {cbot_str}. '
-        f'Replacement Maíz: <b>Premium c/bu = (FOB U$/t × 100 / 39,368) − CBOT Corn c/bu</b>. '
-        f'Solo se calcula sobre maíz; para Trigo/Sorgo/Cebada se muestra únicamente FOB MINAGRI. '
+        f'Fuentes: MAGyP – DJVE Ley 21.453 (Aprobadas) · DINEM – FOB Oficial circular publicada el {fob_dt_str}. '
         f'Variación FOB: diferencia en USD/t respecto del último FOB publicado anterior. '
         f'Presentación FOB asumida "A granel ≤ 15% embolsado".', FOOT))
 
@@ -540,29 +513,32 @@ def build_doc(out_path):
 for p in [dated_out, latest_out]:
     build_doc(p)
 
-# ===== 5. Send email =====
-step("5. Enviando mail")
+# ===== 5. Send email — solo si hay DJVE registradas hoy =====
+step("5. Verificando si las DJVE de hoy están publicadas")
+today_cal_date = datetime.now().date()
+djve_today = df[df['fecha_registro_dt'].apply(
+    lambda d: d.date() == today_cal_date if d is not None else False
+)]
+if len(djve_today) == 0:
+    print(f"   Las DJVE del {today_cal_date:%d/%m/%Y} no están publicadas todavía. "
+          f"No se envía mail. (Último registro disponible: {fecha_reg})")
+    print("\n✔ Script terminado sin envío. Cache FOB actualizado.")
+    sys.exit(0)
+
+print(f"   ✓ Hay {len(djve_today)} DJVE registradas hoy. Procedo a enviar.")
+step("6. Enviando mail")
 try:
     sys.path.insert(0, str(Path(__file__).resolve().parent))
     from send_email import send_report
-    # Mini summary for email body
-    # Restringir summary a cereales para coherencia con el PDF
     cereal_kws = [kw for _, kw in CEREALES]
     df_cer_email = df_big[df_big['producto'].apply(lambda p: any(kw in p.upper() for kw in cereal_kws))]
-    # Premium ponderado para el body del mail
-    vp = df_cer_email[df_cer_email['premium_cents_bu'].notna()]
-    if len(vp) > 0 and vp['toneladas_num'].sum() > 0:
-        avg_prem_email = (vp['premium_cents_bu'] * vp['toneladas_num']).sum() / vp['toneladas_num'].sum()
-        prem_str_email = f'{avg_prem_email:+.1f} c/bu'
-    else:
-        prem_str_email = '—'
     summary = {
         'fecha_registro': fecha_reg,
         'total_djve': len(df_cer_email),
         'total_ton_fmt': (fmt_int(df_cer_email['toneladas_num'].sum()) + ' t') if len(df_cer_email) else '0 t',
         'n_shippers': df_cer_email['razon_social'].nunique() if len(df_cer_email) else 0,
         'top_prod': '-',
-        'top_prod_pct': f'Premium pond. {prem_str_email}',
+        'top_prod_pct': '',
         'top_shipper': '-',
     }
     if len(df_cer_email) > 0:
